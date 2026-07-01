@@ -1,0 +1,25 @@
+{
+  "name": "@skipi/host-runtime",
+  "version": "1.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Shared §1 isolated plugin host runtime for all Skipi homes (single source -> file + inline emits).",
+  "main": "dist/plugin-host-bridge.js",
+  "scripts": {
+    "emit": "node tools/emit.js",
+    "test": "node harness/isolation-contract.mjs",
+    "check": "node --check src/runtime.js && node --check tools/emit.js && node --check harness/isolation-contract.mjs && node --check harness/fake-dom.mjs"
+  },
+  "files": [
+    "src/runtime.js",
+    "dist/plugin-host-bridge.js",
+    "dist/runtime.inline.html",
+    "dist/RUNTIME_VERSION",
+    "tools/emit.js",
+    "harness/isolation-contract.mjs",
+    "harness/fake-dom.mjs",
+    "CONTRACT.md",
+    "CHANGELOG.md",
+    "README.md"
+  ]
+}
