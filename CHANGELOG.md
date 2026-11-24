@@ -3,6 +3,24 @@
 Semver per `CONTRACT.md`: MAJOR = breaking wire/`cfg`/`api`/loader/host change;
 MINOR = additive; PATCH = backwards-compatible bug fix.
 
+## 1.1.0 — 2026-11-24
+
+Additive (MINOR). Owner decision 24.11.2026: plugins may use the network, if it is safe and breaks nothing.
+
+- `hostApi.net.fetch` — **host-mediated** network. The frame CSP is unchanged (`connect-src 'none'`); the host
+  performs the request only with the `network` grant, only to `https` URLs inside the verified pack's
+  `network.allow`, without cookies/credentials and without following redirects. Opt-in per home (`cfg.host.net`).
+- `hostApi.files.save` / `hostApi.files.pick` — host-mediated files, grants `file_save` / `file_pick`, relayed to
+  `cfg.host.files` (opt-in per home).
+- Frame CSP `script-src` gains `'wasm-unsafe-eval'`: a plugin may run a WebAssembly module from its own verified
+  pack (Draft Survey's calculation core is the Rust core compiled to wasm). No eval, no network.
+- New wire messages `net.fetch`, `files.save`, `files.pick` (frame → host) and `rpc.result` (host → frame). An
+  answer is delivered only to the mount that asked.
+- A home on 1.0.x is unaffected: without `cfg.host.net` / `cfg.host.files` and without the new grants every new
+  call is refused. Existing plugins never send the new messages.
+- Contract test: 27 → 53 assertions (allowlist escapes, header filtering, default transport options,
+  cross-mount answers, frame-side shim).
+
 ## 1.0.1 — 2026-06-30
 
 Bug fix:

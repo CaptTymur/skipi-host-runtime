@@ -106,6 +106,8 @@ export async function runIsolationContract(opts = {}) {
   ok(ifr.attrs.sandbox === 'allow-scripts', 'sandbox="allow-scripts"');
   ok(!/allow-same-origin/.test(ifr.attrs.sandbox || ''), 'NO allow-same-origin (opaque cross-origin)');
   ok(/default-src 'none'/.test(ifr.srcdoc) && /connect-src 'none'/.test(ifr.srcdoc), "frame srcdoc carries strict default-deny CSP (default-src 'none'; connect-src 'none')");
+  ok(/script-src 'nonce-[0-9a-f]+' 'wasm-unsafe-eval';/.test(ifr.srcdoc) && !/'unsafe-eval'/.test(ifr.srcdoc) && !/'unsafe-inline'/.test(ifr.srcdoc),
+    "script-src is nonce + 'wasm-unsafe-eval' only (v1.1) — no 'unsafe-eval', no 'unsafe-inline'");
   ok(/__SKIPI_TOKEN__=/.test(ifr.srcdoc), 'frame boots with a per-mount capability token');
   ok(!ifr.srcdoc.includes(secretVal), 'host secret is NOT in the frame srcdoc');
   const tokMatch = ifr.srcdoc.match(/__SKIPI_TOKEN__=("[0-9a-f]+")/);
@@ -184,6 +186,189 @@ export async function runIsolationContract(opts = {}) {
   const rOff = await rtOff.open(slug, meOff);
   ok(rOff && rOff.ok === false && rOff.stage === 'flag', 'disabled runtime returns stage:flag');
   ok(meOff._child === null, 'disabled runtime created NO frame (boot untouched)');
+
+  // ---------------------------------------------------------------- v1.1 --
+  // Host-mediated network + files. The frame CSP is unchanged (asserted above);
+  // what is asserted here is the HOST side of the bridge: grant, signed allowlist,
+  // safe request shape, and that an answer only goes back to the mount that asked.
+  const netPack = (perms, allow) => ({
+    async install() {
+      return { ok: true, source: 'fixture', pack: {
+        entrypoints: { ui: 'index.js', style: 'index.css' }, files: { 'index.js': '/* net fixture */', 'index.css': '' },
+        permissions: perms.slice(), network: allow ? { allow } : undefined,
+      } };
+    },
+  });
+  async function bootNet(perms, allow, hostExtra) {
+    const calls = [];
+    const h = Object.assign({}, host, hostExtra ? hostExtra(calls) : {});
+    const rtN = globalThis.SkipiPluginRuntime.create({ enabled: true, loader: netPack(perms, allow), host: h });
+    const me = ctx.makeMountEl();
+    const op = rtN.open(slug, me);
+    const tok = JSON.parse(me._child.srcdoc.match(/__SKIPI_TOKEN__=("[0-9a-f]+")/)[1]);
+    await ctx.tick(); await ctx.tick();
+    ctx.emit({ ch: 'skipi-plugin', v: 1, token: tok, type: 'ready' });
+    ctx.emit({ ch: 'skipi-plugin', v: 1, token: tok, type: 'mounted', height: 100, selfcheck: {} });
+    await op;
+    const ask = async (msg) => {
+      ctx.framePosts.length = 0;
+      ctx.emit(Object.assign({ ch: 'skipi-plugin', v: 1, token: tok }, msg));
+      await ctx.tick(); await ctx.tick();
+      return ctx.framePosts.find((m) => m.type === 'rpc.result' && m.id === msg.id);
+    };
+    return { rt: rtN, calls, ask, tok };
+  }
+  const API = 'https://api.example.test/draft-survey/v1';
+  const fakeNet = (calls) => ({ net: { fetch: async (s, req) => { calls.push({ slug: s, req }); return { ok: true, status: 200, headers: { 'content-type': 'application/json' }, text: '{"pong":1}' }; } } });
+
+  section('v1.1 net.fetch — refused without the grant, without the host, outside the allowlist');
+  {
+    const a = await bootNet([], [API], fakeNet);
+    const r = await a.ask({ type: 'net.fetch', id: 1, url: API + '/ships/1' });
+    ok(r && r.ok === false && a.calls.length === 0, 'no `network` permission → refused, the host transport is never called');
+    ok(a.rt._audit().some((x) => /DENY net\.fetch/.test(x)), 'and the refusal is audited');
+    a.rt.close();
+    const b = await bootNet(['network'], [API], null);
+    const r2 = await b.ask({ type: 'net.fetch', id: 2, url: API + '/ships/1' });
+    ok(r2 && r2.ok === false && /not available/.test(r2.error), 'granted, but the home did not opt in (no host.net) → refused');
+    b.rt.close();
+    const c = await bootNet(['network'], undefined, fakeNet);
+    const r3 = await c.ask({ type: 'net.fetch', id: 3, url: API + '/ships/1' });
+    ok(r3 && r3.ok === false && c.calls.length === 0, 'granted, but the pack declares no allowlist → refused');
+    c.rt.close();
+  }
+  {
+    const a = await bootNet(['network'], [API], fakeNet);
+    const bad = [
+      'http://api.example.test/draft-survey/v1/ships/1',            // not https
+      'https://evil.example.test/draft-survey/v1/ships/1',          // other origin
+      'https://api.example.test.evil.test/draft-survey/v1/x',       // suffix trick
+      'https://api.example.test/draft-survey/v1x/ships',            // prefix trick
+      'https://api.example.test/draft-survey/v1/../../api/app/login', // traversal out of the prefix
+      'https://api.example.test/other',                             // other path
+      'https://user:pw@api.example.test/draft-survey/v1/ships/1',   // userinfo
+      'https://api.example.test:8443/draft-survey/v1/ships/1',      // other port
+      'file:///etc/passwd', 'javascript:alert(1)', 'not a url',
+    ];
+    let id = 10, allRefused = true;
+    for (const u of bad) { const r = await a.ask({ type: 'net.fetch', id: ++id, url: u }); if (!(r && r.ok === false)) { allRefused = false; console.error('    not refused: ' + u); } }
+    ok(allRefused && a.calls.length === 0, 'every URL outside the signed allowlist is refused (scheme, origin, port, path prefix, traversal, userinfo)');
+    const rm = await a.ask({ type: 'net.fetch', id: 40, url: API + '/ships/1', method: 'TRACE' });
+    ok(rm && rm.ok === false && a.calls.length === 0, 'a method outside GET/POST/PUT/PATCH/DELETE is refused');
+
+    section('v1.1 net.fetch — an allowed request reaches the host transport cleaned, and the answer returns');
+    const r = await a.ask({ type: 'net.fetch', id: 41, url: API + '/ships/9074729?x=1', method: 'post', body: '{"a":1}',
+      headers: { 'Content-Type': 'application/json', 'X-App-Key': 'k', Cookie: 'sid=1', Host: 'evil', 'Sec-Fetch-Site': 'x', 'Bad\nName': 'v', 'X-Inject': 'a\r\nb' } });
+    ok(r && r.ok === true && r.value && r.value.status === 200 && r.value.text === '{"pong":1}', 'allowed URL → the plugin gets {ok,status,headers,text}');
+    const call = a.calls[0] || { req: {} };
+    ok(a.calls.length === 1 && call.slug === slug && call.req.url === API + '/ships/9074729?x=1' && call.req.method === 'POST' && call.req.body === '{"a":1}', 'the transport receives the validated url, an upper-cased method and the body');
+    const hk = Object.keys(call.req.headers || {});
+    ok(hk.includes('Content-Type') && hk.includes('X-App-Key') && !hk.some((k) => /cookie|host|sec-|bad|inject/i.test(k)), 'cookie / host / sec-* and malformed headers are dropped; the plugin\'s own headers pass');
+    ok(JSON.stringify(call.req).indexOf(secretVal) < 0 && JSON.stringify(r).indexOf(secretVal) < 0, 'no host secret in the outgoing request or in the answer');
+    a.rt.close();
+  }
+
+  section('v1.1 default transport — the host fetch is called with credentials omitted and redirects refused');
+  {
+    const seen = [];
+    const prevFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => { seen.push({ url, init }); return { ok: true, status: 201, headers: { get: () => 'application/json; charset=utf-8' }, arrayBuffer: async () => new TextEncoder().encode('{"id":7}').buffer }; };
+    try {
+      const a = await bootNet(['network'], [API + '/'], () => ({ net: {} }));
+      const r = await a.ask({ type: 'net.fetch', id: 50, url: API + '/ships', method: 'POST', bodyBase64: Buffer.from('hello').toString('base64') });
+      const i0 = (seen[0] || {}).init || {};
+      ok(r && r.ok === true && r.value.status === 201 && r.value.text === '{"id":7}', 'default transport returns the response to the plugin');
+      ok(seen.length === 1 && i0.credentials === 'omit' && i0.redirect === 'error' && i0.referrerPolicy === 'no-referrer', "fetch options are fixed by the runtime: credentials 'omit', redirect 'error', no referrer");
+      ok(i0.body instanceof Uint8Array && Buffer.from(i0.body).toString() === 'hello', 'a base64 body is sent as bytes');
+      a.rt.close();
+    } finally { globalThis.fetch = prevFetch; }
+  }
+
+  section('v1.1 an answer never crosses mounts');
+  {
+    let release;
+    const slow = () => ({ net: { fetch: () => new Promise((r) => { release = () => r({ ok: true, status: 200, headers: {}, text: 'late' }); }) } });
+    const a = await bootNet(['network'], [API], slow);
+    ctx.framePosts.length = 0;
+    ctx.emit({ ch: 'skipi-plugin', v: 1, token: a.tok, type: 'net.fetch', id: 60, url: API + '/ships/1' });
+    await ctx.tick();
+    a.rt.close();
+    // the SAME runtime instance now hosts another mount (new token)
+    const me2 = ctx.makeMountEl();
+    const op2 = a.rt.open(slug, me2);
+    const tok2 = JSON.parse(me2._child.srcdoc.match(/__SKIPI_TOKEN__=("[0-9a-f]+")/)[1]);
+    await ctx.tick(); await ctx.tick();
+    ctx.emit({ ch: 'skipi-plugin', v: 1, token: tok2, type: 'ready' });
+    ctx.emit({ ch: 'skipi-plugin', v: 1, token: tok2, type: 'mounted', height: 100, selfcheck: {} });
+    await op2;
+    ok(tok2 !== a.tok && a.rt._active() !== null, 'a second mount is active on the same runtime, with a new token');
+    ctx.framePosts.length = 0;
+    release(); await ctx.tick(); await ctx.tick();
+    ok(!ctx.framePosts.some((m) => m.type === 'rpc.result'), 'a response that arrives after the plugin was closed is NOT delivered to the next mount');
+    a.rt.close();
+  }
+
+  section('v1.1 files.save / files.pick — by grant, through the home, with a safe file name');
+  {
+    const withFiles = (calls) => ({ files: {
+      save: async (s, f) => { calls.push({ op: 'save', slug: s, f }); return { saved: true }; },
+      pick: async (s, o) => { calls.push({ op: 'pick', slug: s, o }); return [{ name: 'a.json', mime: 'application/json', base64: 'e30=' }]; },
+    } });
+    const a = await bootNet(['file_save'], null, withFiles);
+    const r1 = await a.ask({ type: 'files.save', id: 70, name: '../../etc/passwd', mime: 'application/pdf', base64: 'JVBERg==' });
+    ok(r1 && r1.ok === true && r1.value.saved === true, 'files.save with the grant reaches the home');
+    ok(a.calls.length === 1 && a.calls[0].slug === slug && !/[\\/]/.test(a.calls[0].f.name) && !/^\./.test(a.calls[0].f.name), 'the file name is reduced to a plain name (no path, no leading dots)');
+    const r2 = await a.ask({ type: 'files.pick', id: 71, accept: 'image/*' });
+    ok(r2 && r2.ok === false && a.calls.length === 1, 'files.pick without ITS grant is refused (file_save does not imply file_pick)');
+    a.rt.close();
+    const b = await bootNet(['file_pick'], null, withFiles);
+    const r3 = await b.ask({ type: 'files.pick', id: 72, accept: 'image/*', multiple: true });
+    ok(r3 && r3.ok === true && Array.isArray(r3.value) && r3.value[0].name === 'a.json' && b.calls[0].o.multiple === true, 'files.pick with the grant returns what the user chose');
+    b.rt.close();
+    const c = await bootNet(['file_save', 'file_pick'], null, null);
+    const r4 = await c.ask({ type: 'files.save', id: 73, name: 'x.txt', text: 'x' });
+    ok(r4 && r4.ok === false, 'granted, but the home has no files adapter → refused');
+    c.rt.close();
+  }
+
+  section('v1.1 the frame side — hostApi.net / hostApi.files exist and stay shut without the grant');
+  {
+    const shim = (runtimeSource.match(/var SHIM_SRC = `([\s\S]*?)`;/) || [])[1] || '';
+    ok(shim.length > 0, 'the frame shim source was found');
+    const posts = []; let onMsg = null; let hostApi = null;
+    const frameWin = {
+      __SKIPI_TOKEN__: 'T', SkipiPlugins: {}, parent: { postMessage: (m) => posts.push(m) },
+      addEventListener: (t, fn) => { if (t === 'message') onMsg = fn; },
+      localStorage: { getItem() { throw new Error('blocked'); } },
+    };
+    const frameDoc = { head: { appendChild() {} }, body: { scrollHeight: 10 }, createElement: () => ({}) };
+    new Function('window', 'document', 'parent', 'fetch', 'setTimeout', 'ResizeObserver', shim)(
+      frameWin, frameDoc, frameWin.parent, () => Promise.reject(new Error('csp')), setTimeout, undefined);
+    const mountWith = async (perms) => {
+      frameWin.SkipiPlugins[slug] = { mount: (el, api) => { hostApi = api; } };
+      onMsg({ data: { ch: 'skipi-plugin', token: 'T', type: 'init', slug, css: '', js: '', permissions: perms, nonce: 'n', hostId: 'h' } });
+      await ctx.tick(); await ctx.tick();
+    };
+    await mountWith([]);
+    ok(hostApi && typeof hostApi.net.fetch === 'function' && typeof hostApi.files.save === 'function' && typeof hostApi.files.pick === 'function', 'hostApi carries net.fetch, files.save and files.pick');
+    posts.length = 0;
+    let rejected = 0;
+    await hostApi.net.fetch(API + '/x').catch(() => rejected++);
+    await hostApi.files.save({ name: 'a', text: 'b' }).catch(() => rejected++);
+    await hostApi.files.pick({}).catch(() => rejected++);
+    ok(rejected === 3 && posts.length === 0, 'without grants all three reject in the frame and post nothing to the host');
+    await mountWith(['network']);
+    posts.length = 0;
+    const pr = hostApi.net.fetch(API + '/x', { method: 'POST', body: '{}' });
+    const sent = posts.find((m) => m.type === 'net.fetch');
+    ok(sent && sent.token === 'T' && sent.url === API + '/x' && sent.method === 'POST', 'with the grant net.fetch posts a token-stamped net.fetch message');
+    onMsg({ data: { ch: 'skipi-plugin', token: 'T', type: 'rpc.result', id: sent.id, ok: true, value: { ok: true, status: 200, text: 'hi' } } });
+    ok((await pr).text === 'hi', 'and the promise resolves with the host answer');
+    const pr2 = hostApi.net.fetch(API + '/y');
+    const sent2 = posts.filter((m) => m.type === 'net.fetch')[1];
+    onMsg({ data: { ch: 'skipi-plugin', token: 'T', type: 'rpc.result', id: sent2.id, ok: false, error: 'url is not in the plugin allowlist' } });
+    ok(await pr2.then(() => false, (e) => /allowlist/.test(e.message)), 'a host refusal rejects the promise with the reason');
+  }
 
   return { pass, fail };
 }
