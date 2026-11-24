@@ -6,6 +6,9 @@ Management). One source → two delivery shapes, so no home copy-pastes the secu
 - A plugin runs inside a **sandboxed, opaque-origin iframe** (`allow-scripts`, no `allow-same-origin`) with a
   strict default-deny CSP (`connect-src 'none'`), reached only through a **per-mount token-gated postMessage
   bridge**. No host DOM, no network, no host storage/tokens in the frame.
+- Since 1.1 a plugin with the `network` grant can ask the **host** to make a request (`hostApi.net.fetch`) to the
+  `https` addresses listed in its verified pack, and with `file_save` / `file_pick` can save or pick a file through
+  the platform dialog. The frame itself stays closed.
 - The runtime is **loader-agnostic** and **host-injection-agnostic**: a home supplies `cfg.loader`
   (bundled bytes or signed pack) and `cfg.host` (id / namespaced storage / theme / navigation). The runtime
   owns the frame, CSP, token, shim, and wire schema.
