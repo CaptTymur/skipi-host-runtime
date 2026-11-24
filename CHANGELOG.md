@@ -12,6 +12,8 @@ Additive (MINOR). Owner decision 24.11.2026: plugins may use the network, if it 
   `network.allow`, without cookies/credentials and without following redirects. Opt-in per home (`cfg.host.net`).
 - `hostApi.files.save` / `hostApi.files.pick` — host-mediated files, grants `file_save` / `file_pick`, relayed to
   `cfg.host.files` (opt-in per home).
+- Frame CSP `script-src` gains `'wasm-unsafe-eval'`: a plugin may run a WebAssembly module from its own verified
+  pack (Draft Survey's calculation core is the Rust core compiled to wasm). No eval, no network.
 - New wire messages `net.fetch`, `files.save`, `files.pick` (frame → host) and `rpc.result` (host → frame). An
   answer is delivered only to the mount that asked.
 - A home on 1.0.x is unaffected: without `cfg.host.net` / `cfg.host.files` and without the new grants every new

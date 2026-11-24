@@ -106,6 +106,8 @@ export async function runIsolationContract(opts = {}) {
   ok(ifr.attrs.sandbox === 'allow-scripts', 'sandbox="allow-scripts"');
   ok(!/allow-same-origin/.test(ifr.attrs.sandbox || ''), 'NO allow-same-origin (opaque cross-origin)');
   ok(/default-src 'none'/.test(ifr.srcdoc) && /connect-src 'none'/.test(ifr.srcdoc), "frame srcdoc carries strict default-deny CSP (default-src 'none'; connect-src 'none')");
+  ok(/script-src 'nonce-[0-9a-f]+' 'wasm-unsafe-eval';/.test(ifr.srcdoc) && !/'unsafe-eval'/.test(ifr.srcdoc) && !/'unsafe-inline'/.test(ifr.srcdoc),
+    "script-src is nonce + 'wasm-unsafe-eval' only (v1.1) — no 'unsafe-eval', no 'unsafe-inline'");
   ok(/__SKIPI_TOKEN__=/.test(ifr.srcdoc), 'frame boots with a per-mount capability token');
   ok(!ifr.srcdoc.includes(secretVal), 'host secret is NOT in the frame srcdoc');
   const tokMatch = ifr.srcdoc.match(/__SKIPI_TOKEN__=("[0-9a-f]+")/);

@@ -138,8 +138,10 @@ without `network` / outside the allowlist, or a `files.*` without its grant → 
 
 - `iframe sandbox="allow-scripts"` with **no** `allow-same-origin` (opaque origin, cross-origin to host),
   `referrerpolicy="no-referrer"`.
-- Frame `srcdoc` CSP: `default-src 'none'; script-src 'nonce-…'; style-src 'nonce-…'; img-src data:;
-  connect-src 'none'; base-uri 'none'; form-action 'none'`. No eval, no unsafe-inline (nonce'd injection).
+- Frame `srcdoc` CSP: `default-src 'none'; script-src 'nonce-…' 'wasm-unsafe-eval'; style-src 'nonce-…';
+  img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'`. No eval, no unsafe-inline (nonce'd
+  injection). `'wasm-unsafe-eval'` (v1.1) allows a plugin to instantiate a WebAssembly module carried inside its
+  own verified pack; it grants no network and nothing the plugin's JS could not already do.
 - Per-mount capability **token** + per-mount **nonce** (16 random bytes each via `crypto.getRandomValues`).
 - No host DOM, no network, no host storage/tokens in the frame. v1.1 does **not** change this: `net.fetch` and
   `files.*` are requests to the host, not capabilities of the frame.
