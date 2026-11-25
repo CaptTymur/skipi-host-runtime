@@ -111,7 +111,7 @@
       screen: {
         keepAwake: function (on) { if (!has('keep_awake')) return notGranted('keep_awake'); return rpc('screen.keepAwake', { on: !!on }); }
       },
-      // v1.3: the host captures and pushes; start/stop are requests, on* subscribes to the pushes.
+      // v1.3: the host captures and pushes; start/stop are requests, on* registers a listener for the pushes.
       camera: stream('camera', 'onFrame'),
       microphone: stream('microphone', 'onChunk'),
       location: stream('location', 'onPosition'),
