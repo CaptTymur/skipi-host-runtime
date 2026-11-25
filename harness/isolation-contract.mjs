@@ -370,6 +370,125 @@ export async function runIsolationContract(opts = {}) {
     ok(await pr2.then(() => false, (e) => /allowlist/.test(e.message)), 'a host refusal rejects the promise with the reason');
   }
 
+  // ---------------------------------------------------------------- v1.2 --
+  // Host-mediated motion sensors + keep-awake. The frame gets no sensor access of its own
+  // (sandbox / CSP asserted above are unchanged); the HOST reads the sensors and pushes rows.
+  const fakeMotion = (calls) => ({
+    motion: {
+      start: async (s, o, push) => { calls.push({ op: 'start', slug: s, o, push }); return { ok: true, rateHz: o.rateHz, source: 'fake', platform: 'test' }; },
+      stop: (s) => { calls.push({ op: 'stop', slug: s }); },
+    },
+    screen: { keepAwake: async (s, on) => { calls.push({ op: 'awake', slug: s, on }); return { ok: true }; } },
+  });
+
+  section('v1.2 motion / keep-awake — refused without the grant or without the home');
+  {
+    const a = await bootNet([], null, fakeMotion);
+    const r = await a.ask({ type: 'motion.start', id: 80, rateHz: 50 });
+    const r2 = await a.ask({ type: 'screen.keepAwake', id: 81, on: true });
+    ctx.emit({ ch: 'skipi-plugin', v: 1, token: a.tok, type: 'motion.stop' });
+    ok(r && r.ok === false && r2 && r2.ok === false && a.calls.length === 0, 'no `motion` / `keep_awake` grant → refused, the home sensors are never started');
+    ok(a.rt._audit().some((x) => /DENY motion\.start/.test(x)) && a.rt._audit().some((x) => /DENY screen\.keepAwake/.test(x)) && a.rt._audit().some((x) => /DENY motion\.stop/.test(x)), 'and the refusals are audited');
+    a.rt.close();
+    ok(a.calls.length === 0, 'closing a plugin that never started sensors does not call the home');
+    const b = await bootNet(['motion', 'keep_awake'], null, null);
+    const r3 = await b.ask({ type: 'motion.start', id: 82 });
+    const r4 = await b.ask({ type: 'screen.keepAwake', id: 83, on: true });
+    ok(r3 && r3.ok === false && /not available/.test(r3.error) && r4 && r4.ok === false && /not available/.test(r4.error), 'granted, but the home did not opt in (no host.motion / host.screen) → refused');
+    b.rt.close();
+    const c = await bootNet(['motion'], null, fakeMotion);
+    const r5 = await c.ask({ type: 'screen.keepAwake', id: 84, on: true });
+    ok(r5 && r5.ok === false && c.calls.length === 0, '`motion` does not imply `keep_awake`');
+    c.rt.close();
+  }
+
+  section('v1.2 motion — rows reach only the mount that started the sensors, cleaned; close() stops everything');
+  {
+    const a = await bootNet(['motion', 'keep_awake'], null, fakeMotion);
+    const r = await a.ask({ type: 'motion.start', id: 90, rateHz: 5000 });
+    const st = a.calls.find((c) => c.op === 'start') || { o: {} };
+    ok(r && r.ok === true && r.value.ok === true && st.slug === slug && st.o.rateHz === 100, 'motion.start reaches the home with the rate clamped to 1–100 Hz, and the answer returns');
+    ctx.framePosts.length = 0;
+    const good7 = [1000, 0.1, 0.2, 9.81, 0.01, 0.02, 0.03], good4 = [1010, 0.1, 0.2, 9.81], noGyro = [1020, 0, 0, 9.81, null, null, null];
+    const delivered = st.push([good7, good4, noGyro, [1, 2, 3], 'x', [1, NaN, 0, 0], [1, null, 0, 0], [1, 0, 0, 9.8, 'a', 0, 0], { t: 1 }]);
+    const batch = ctx.framePosts.find((m) => m.type === 'motion.batch');
+    ok(delivered === true && batch && batch.seq === 1 && JSON.stringify(batch.samples) === JSON.stringify([good7, good4, noGyro]), 'only well-formed rows (4 or 7 finite numbers; null allowed for the gyro only) are forwarded, seq starts at 1');
+    ctx.framePosts.length = 0;
+    st.push(Array.from({ length: 800 }, (_, i) => [i, 0, 0, 9.81]));
+    const big = ctx.framePosts.find((m) => m.type === 'motion.batch');
+    ok(big && big.samples.length === 500 && big.seq === 2, 'a batch is capped at 500 rows; seq grows by 1');
+    ctx.framePosts.length = 0;
+    st.push([]); st.push('junk');
+    ok(!ctx.framePosts.some((m) => m.type === 'motion.batch'), 'an empty or malformed push sends nothing');
+    const r2 = await a.ask({ type: 'screen.keepAwake', id: 91, on: 1 });
+    ok(r2 && r2.ok === true && a.calls.some((c) => c.op === 'awake' && c.on === true && c.slug === slug), 'screen.keepAwake with the grant reaches the home as a boolean');
+    a.rt.close();
+    ok(a.calls.some((c) => c.op === 'stop' && c.slug === slug) && a.calls.some((c) => c.op === 'awake' && c.on === false), 'close() itself stops the sensors and releases keep-awake, whatever the plugin did');
+    // the same runtime now hosts another mount: the old push must be inert
+    const me2 = ctx.makeMountEl();
+    const op2 = a.rt.open(slug, me2);
+    const tok2 = JSON.parse(me2._child.srcdoc.match(/__SKIPI_TOKEN__=("[0-9a-f]+")/)[1]);
+    await ctx.tick(); await ctx.tick();
+    ctx.emit({ ch: 'skipi-plugin', v: 1, token: tok2, type: 'ready' });
+    ctx.emit({ ch: 'skipi-plugin', v: 1, token: tok2, type: 'mounted', height: 100, selfcheck: {} });
+    await op2;
+    ctx.framePosts.length = 0;
+    const late = st.push([good7]);
+    ok(late === false && !ctx.framePosts.some((m) => m.type === 'motion.batch'), 'after close the old push is inert: nothing reaches the next mount');
+    a.rt.close();
+  }
+  {
+    const a = await bootNet(['motion'], null, fakeMotion);
+    await a.ask({ type: 'motion.start', id: 95 });
+    ctx.emit({ ch: 'skipi-plugin', v: 1, token: a.tok, type: 'motion.stop' });
+    ok(a.calls.filter((c) => c.op === 'stop').length === 1, 'motion.stop from the plugin stops the home sensors');
+    a.rt.close();
+    ok(a.calls.filter((c) => c.op === 'stop').length === 1 && !a.calls.some((c) => c.op === 'awake'), 'and close() does not stop them a second time nor touch keep-awake that was never taken');
+  }
+
+  section('v1.2 the frame side — hostApi.motion / hostApi.screen stay shut without the grant; batches reach subscribers');
+  {
+    const shim = (runtimeSource.match(/var SHIM_SRC = `([\s\S]*?)`;/) || [])[1] || '';
+    const posts = []; let onMsg = null; let hostApi = null;
+    const frameWin = {
+      __SKIPI_TOKEN__: 'T', SkipiPlugins: {}, parent: { postMessage: (m) => posts.push(m) },
+      addEventListener: (t, fn) => { if (t === 'message') onMsg = fn; },
+      localStorage: { getItem() { throw new Error('blocked'); } },
+    };
+    const frameDoc = { head: { appendChild() {} }, body: { scrollHeight: 10 }, createElement: () => ({}) };
+    new Function('window', 'document', 'parent', 'fetch', 'setTimeout', 'ResizeObserver', shim)(
+      frameWin, frameDoc, frameWin.parent, () => Promise.reject(new Error('csp')), setTimeout, undefined);
+    const mountWith = async (perms) => {
+      frameWin.SkipiPlugins[slug] = { mount: (el, api) => { hostApi = api; } };
+      onMsg({ data: { ch: 'skipi-plugin', token: 'T', type: 'init', slug, css: '', js: '', permissions: perms, nonce: 'n', hostId: 'h' } });
+      await ctx.tick(); await ctx.tick();
+    };
+    await mountWith([]);
+    posts.length = 0;
+    let rejected = 0;
+    await hostApi.motion.start({ rateHz: 50 }).catch(() => rejected++);
+    await hostApi.screen.keepAwake(true).catch(() => rejected++);
+    hostApi.motion.stop();
+    ok(rejected === 2 && posts.length === 0, 'without grants motion.start / screen.keepAwake reject in the frame and nothing is posted to the host');
+    await mountWith(['motion', 'keep_awake']);
+    posts.length = 0;
+    const got = [];
+    const off = hostApi.motion.onSamples((b) => got.push(b));
+    const pr = hostApi.motion.start({ rateHz: 50 });
+    const sent = posts.find((m) => m.type === 'motion.start');
+    ok(sent && sent.token === 'T' && sent.rateHz === 50, 'with the grant motion.start posts a token-stamped message');
+    onMsg({ data: { ch: 'skipi-plugin', token: 'T', type: 'rpc.result', id: sent.id, ok: true, value: { ok: true, rateHz: 50 } } });
+    ok((await pr).rateHz === 50, 'and resolves with the host answer');
+    onMsg({ data: { ch: 'skipi-plugin', token: 'T', type: 'motion.batch', seq: 1, samples: [[1, 0, 0, 9.81]] } });
+    onMsg({ data: { ch: 'skipi-plugin', token: 'BAD', type: 'motion.batch', seq: 2, samples: [[2, 0, 0, 9.81]] } });
+    ok(got.length === 1 && got[0].seq === 1 && got[0].samples[0][3] === 9.81, 'a motion.batch reaches onSamples subscribers; a batch with a wrong token is ignored');
+    off();
+    onMsg({ data: { ch: 'skipi-plugin', token: 'T', type: 'motion.batch', seq: 3, samples: [[3, 0, 0, 9.81]] } });
+    ok(got.length === 1, 'unsubscribe stops delivery');
+    hostApi.motion.stop();
+    ok(posts.some((m) => m.type === 'motion.stop'), 'motion.stop posts to the host');
+  }
+
   return { pass, fail };
 }
 

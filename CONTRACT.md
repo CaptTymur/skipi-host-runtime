@@ -1,4 +1,4 @@
-# Skipi Plugin Host Runtime — Contract (v1.1)
+# Skipi Plugin Host Runtime — Contract (v1.2)
 
 Canonical contract for the shared §1 isolated plugin runtime. The runtime is the
 **single source** every Skipi home embeds; this document is the API it guarantees.
@@ -64,7 +64,10 @@ host = {
   navigation:{ setTitle(s), closePlugin() },
   net?:     { fetch?(slug, req) -> Promise<res> },       // v1.1, OPT-IN: absent → every net.fetch is refused
   files?:   { save?(slug, file) -> Promise<{saved}>,     // v1.1, OPT-IN: absent → files.* are refused
-              pick?(slug, {accept, multiple}) -> Promise<[{name, mime, base64}]> }
+              pick?(slug, {accept, multiple}) -> Promise<[{name, mime, base64}]> },
+  motion?:  { start(slug, {rateHz}, push) -> Promise<{ok, rateHz, source, platform} | {ok:false, reason}>,
+              stop(slug) },                              // v1.2, OPT-IN: absent → motion.* are refused
+  screen?:  { keepAwake(slug, on) -> Promise<{ok}> }     // v1.2, OPT-IN: absent → screen.* are refused
 }
 ```
 
@@ -107,6 +110,35 @@ implements them with the platform's own save / share / open dialog: the plugin g
 picked, and can write only where the user chose. The runtime reduces `name` to a plain file name (no path
 separators, no leading dots, ≤120 chars) and caps a file at 32 MB. The two grants are independent.
 
+### Host-mediated motion sensors and keep-awake (v1.2)
+
+The frame has no sensor and no wake-lock access of its own (opaque origin, no `allow` attribute). The **home**
+reads the device sensors and the runtime forwards the rows:
+
+```js
+hostApi.motion.start({ rateHz })   // -> Promise<{ ok, rateHz, source, platform } | { ok:false, reason }>
+hostApi.motion.onSamples(cb)       // -> unsubscribe; cb({ seq, samples })
+hostApi.motion.stop()
+hostApi.screen.keepAwake(on)       // -> Promise<{ ok }>
+```
+
+- Grants: `motion` for `hostApi.motion.*`, `keep_awake` for `hostApi.screen.keepAwake`; they are independent.
+  Without the grant the call is refused in the frame; the host refuses (and audits) it again, and also when the
+  home did not opt in (`cfg.host.motion` / `cfg.host.screen` absent — e.g. a desktop home without sensors may
+  instead answer `{ ok:false, reason:'no-sensors' }`).
+- A sample row is `[t_ms, ax, ay, az, wx, wy, wz]`, or `[t_ms, ax, ay, az]` when there is no gyroscope
+  (`null` is also accepted in the three gyro positions). `t_ms` — monotonic milliseconds of the measurement;
+  `a` — specific force **including gravity**, m/s², device axes x right / y to the top of the device / z out of
+  the screen, so a device lying screen-up reads `az ≈ +9.81` **on every platform** (the home normalises signs);
+  `w` — angular rate, rad/s, right-handed about the same axes.
+- `rateHz` is clamped to 1–100; the home reports the actual rate in its answer. The home calls `push(rows)`
+  about every 100 ms; the runtime drops malformed rows, caps a batch at 500 rows and numbers batches with `seq`
+  (+1 each) so a plugin sees gaps.
+- `push` delivers **only to the mount that started the sensors**; after `close()` it is inert and returns
+  `false` (the home should then stop). `close()` itself calls `host.motion.stop(slug)` and
+  `host.screen.keepAwake(slug, false)` if the plugin left them on.
+- The home stops the sensors when the app goes to the background.
+
 ## postMessage wire schema (fixed by the runtime)
 
 Channel envelope on every message: `{ ch:'skipi-plugin', v:1, token }`. The host validates
@@ -119,6 +151,8 @@ Host → frame:
 - `storage.result` `{ type:'storage.result', id, value }`
 - `rpc.result` `{ type:'rpc.result', id, ok:true, value }` | `{ …, ok:false, error }` (v1.1) — answer to
   `net.fetch` / `files.*`; delivered only to the mount (token) that asked.
+- `motion.batch` `{ type:'motion.batch', seq, samples }` (v1.2) — only to the mount that started the sensors;
+  a 1.1 frame ignores it.
 - `unmount` `{ type:'unmount' }`
 
 Frame → host:
@@ -129,10 +163,13 @@ Frame → host:
 - `nav.setTitle` `{ type:'nav.setTitle', title }` · `nav.close` `{ type:'nav.close' }`
 - `net.fetch` `{ type:'net.fetch', id, url, method?, headers?, body? | bodyBase64? }` (v1.1)
 - `files.save` `{ type:'files.save', id, name, mime?, text? | base64? }` · `files.pick` `{ type:'files.pick', id, accept?, multiple? }` (v1.1)
+- `motion.start` `{ type:'motion.start', id, rateHz? }` · `motion.stop` `{ type:'motion.stop' }` ·
+  `screen.keepAwake` `{ type:'screen.keepAwake', id, on }` (v1.2; answers come as `rpc.result`)
 - `error` `{ type:'error', message }`
 
 **Default-deny:** unknown `type`, wrong `token`, a `storage.*` without granted `local_storage`, a `net.fetch`
-without `network` / outside the allowlist, or a `files.*` without its grant → refused + recorded in the audit log.
+without `network` / outside the allowlist, a `files.*` without its grant, or a `motion.*` / `screen.*` without
+its grant → refused + recorded in the audit log.
 
 ## Frame isolation (fixed by the runtime — do not weaken)
 
@@ -144,7 +181,8 @@ without `network` / outside the allowlist, or a `files.*` without its grant → 
   own verified pack; it grants no network and nothing the plugin's JS could not already do.
 - Per-mount capability **token** + per-mount **nonce** (16 random bytes each via `crypto.getRandomValues`).
 - No host DOM, no network, no host storage/tokens in the frame. v1.1 does **not** change this: `net.fetch` and
-  `files.*` are requests to the host, not capabilities of the frame.
+  `files.*` are requests to the host, not capabilities of the frame. Neither does v1.2: the iframe gets no
+  `allow` attribute; sensor rows and keep-awake are served by the host.
 
 ## Versioning rule (semver)
 
