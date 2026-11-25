@@ -3,6 +3,23 @@
 Semver per `CONTRACT.md`: MAJOR = breaking wire/`cfg`/`api`/loader/host change;
 MINOR = additive; PATCH = backwards-compatible bug fix.
 
+## 1.3.0 — 2026-11-25
+
+Additive (MINOR). Owner decision 25.11.2026: widen the set of host capabilities ahead of the plugins, in one
+release, so that a new plugin does not need a new app build (the next BNWAS is to use the camera to see whether
+a person is present).
+
+- `hostApi.camera` (grant `camera`): JPEG frames pushed by the host — `start / onFrame / stop`.
+- `hostApi.microphone` (grant `microphone`): 16-bit mono chunks with a level — `start / onChunk / stop`.
+- `hostApi.location` (grant `location`): positions — `start / onPosition / stop`.
+- `hostApi.speech` (grant `speech`): `speak / stop` through the system voice.
+- `hostApi.haptics` (grant `vibrate`): `vibrate`.
+- All opt-in per home; grants are independent; options are clamped and pushed items cleaned by the runtime;
+  `close()` stops everything. Frame isolation is unchanged (no `allow` attribute, same sandbox and CSP).
+- New wire messages: `camera|microphone|location.start/.stop`, `speech.speak`, `speech.stop`, `haptics.vibrate`
+  (frame → host), `stream.data` (host → frame).
+- Contract test: 74 → 100 assertions.
+
 ## 1.2.0 — 2026-11-25
 
 Additive (MINOR). Owner decision 25.11.2026: the marine clinometer is to run as a Skipi plugin on the phone's

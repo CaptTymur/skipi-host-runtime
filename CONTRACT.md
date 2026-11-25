@@ -1,4 +1,4 @@
-# Skipi Plugin Host Runtime — Contract (v1.2)
+# Skipi Plugin Host Runtime — Contract (v1.3)
 
 Canonical contract for the shared §1 isolated plugin runtime. The runtime is the
 **single source** every Skipi home embeds; this document is the API it guarantees.
@@ -67,7 +67,13 @@ host = {
               pick?(slug, {accept, multiple}) -> Promise<[{name, mime, base64}]> },
   motion?:  { start(slug, {rateHz}, push) -> Promise<{ok, rateHz, source, platform} | {ok:false, reason}>,
               stop(slug) },                              // v1.2, OPT-IN: absent → motion.* are refused
-  screen?:  { keepAwake(slug, on) -> Promise<{ok}> }     // v1.2, OPT-IN: absent → screen.* are refused
+  screen?:  { keepAwake(slug, on) -> Promise<{ok}> },    // v1.2, OPT-IN: absent → screen.* are refused
+  // v1.3, each OPT-IN (absent → that capability is refused):
+  camera?:     { start(slug, {facing, width, fps, quality}, push) -> Promise<{ok, ...}>, stop(slug) },
+  microphone?: { start(slug, {chunkMs}, push) -> Promise<{ok, ...}>, stop(slug) },
+  location?:   { start(slug, {highAccuracy}, push) -> Promise<{ok, ...}>, stop(slug) },
+  speech?:     { speak(slug, {text, lang, rate, pitch}) -> Promise<{ok}>, stop(slug) },
+  haptics?:    { vibrate(slug, pattern:number[]) -> Promise<{ok}> }
 }
 ```
 
@@ -139,6 +145,32 @@ hostApi.screen.keepAwake(on)       // -> Promise<{ ok }>
   `host.screen.keepAwake(slug, false)` if the plugin left them on.
 - The home stops the sensors when the app goes to the background.
 
+### Host-mediated device capabilities (v1.3)
+
+The frame gets no media, geolocation or device API of its own. The **home** captures, speaks and vibrates; the
+runtime checks the grant, cleans what passes and delivers pushed data only to the mount that asked.
+
+| `hostApi` | Grant | In the frame |
+|---|---|---|
+| `camera.start({facing, width, fps, quality})` · `camera.onFrame(cb)` · `camera.stop()` | `camera` | `cb({seq, t, width, height, mime:'image/jpeg', base64})` |
+| `microphone.start({chunkMs})` · `microphone.onChunk(cb)` · `microphone.stop()` | `microphone` | `cb({seq, t, sampleRate, level, pcm})` — `pcm` is base64 of mono 16-bit little-endian samples, `level` is the chunk RMS 0..1 |
+| `location.start({highAccuracy})` · `location.onPosition(cb)` · `location.stop()` | `location` | `cb({seq, t, lat, lon, accuracy, altitude, speed, heading})` — metres, m/s, degrees; unknown → `null` |
+| `speech.speak({text, lang, rate, pitch})` (or a string) · `speech.stop()` | `speech` | resolves when the phrase was handed to the system voice |
+| `haptics.vibrate(ms \| [on, off, on, …])` | `vibrate` | resolves `{ok}` |
+
+- Grants are independent: none implies another. Without the grant the call is refused in the frame and again by
+  the host (audited); with the grant but without the home's adapter it is refused as "not available".
+- Limits fixed by the runtime: camera `facing` `user`/`environment` (default `environment`), `width` 64–1280
+  (default 320), `fps` 0.2–15 (default 2), `quality` 0.1–0.95; a frame ≤ 2.8 MB of base64, always `image/jpeg`.
+  Microphone `chunkMs` 50–1000 (default 250). Speech text ≤ 500 characters, `rate`/`pitch` 0.5–2, `lang` a plain
+  language tag. Vibration ≤ 16 steps of 0–2000 ms.
+- `start` resolves with the home's answer (`{ok:true, …}` or `{ok:false, reason}` — e.g. the user refused the
+  system permission, or the device has no camera).
+- `push` is inert after `close()` and returns `false`. `close()` itself stops the camera, the microphone, the
+  position watch and any speech the plugin left on.
+- A home SHOULD ask the user before the first use of `camera`, `microphone` and `location` by a given plugin, and
+  MUST stop capture when the app goes to the background.
+
 ## postMessage wire schema (fixed by the runtime)
 
 Channel envelope on every message: `{ ch:'skipi-plugin', v:1, token }`. The host validates
@@ -153,6 +185,8 @@ Host → frame:
   `net.fetch` / `files.*`; delivered only to the mount (token) that asked.
 - `motion.batch` `{ type:'motion.batch', seq, samples }` (v1.2) — only to the mount that started the sensors;
   a 1.1 frame ignores it.
+- `stream.data` `{ type:'stream.data', stream:'camera'|'microphone'|'location', seq, data }` (v1.3) — only to
+  the mount that started that stream.
 - `unmount` `{ type:'unmount' }`
 
 Frame → host:
@@ -165,6 +199,9 @@ Frame → host:
 - `files.save` `{ type:'files.save', id, name, mime?, text? | base64? }` · `files.pick` `{ type:'files.pick', id, accept?, multiple? }` (v1.1)
 - `motion.start` `{ type:'motion.start', id, rateHz? }` · `motion.stop` `{ type:'motion.stop' }` ·
   `screen.keepAwake` `{ type:'screen.keepAwake', id, on }` (v1.2; answers come as `rpc.result`)
+- `camera.start` / `microphone.start` / `location.start` `{ type, id, opts }` · `camera.stop` / `microphone.stop` /
+  `location.stop` `{ type }` · `speech.speak` `{ type, id, text, lang?, rate?, pitch? }` · `speech.stop` ·
+  `haptics.vibrate` `{ type, id, pattern }` (v1.3; answers come as `rpc.result`)
 - `error` `{ type:'error', message }`
 
 **Default-deny:** unknown `type`, wrong `token`, a `storage.*` without granted `local_storage`, a `net.fetch`

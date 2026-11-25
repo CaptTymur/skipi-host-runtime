@@ -1,6 +1,6 @@
 {
   "name": "@skipi/host-runtime",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
   "description": "Shared §1 isolated plugin host runtime for all Skipi homes (single source -> file + inline emits).",

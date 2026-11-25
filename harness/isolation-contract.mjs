@@ -489,6 +489,165 @@ export async function runIsolationContract(opts = {}) {
     ok(posts.some((m) => m.type === 'motion.stop'), 'motion.stop posts to the host');
   }
 
+  // ---------------------------------------------------------------- v1.3 --
+  // Host-mediated device capabilities: camera, microphone, location (pushed streams), speech and
+  // vibration (calls). Each behind its own grant; the home opts in per capability.
+  const fakeDevice = (calls) => {
+    const stream = (name) => ({
+      start: async (s, o, push) => { calls.push({ op: name + '.start', slug: s, o, push }); return { ok: true }; },
+      stop: (s) => { calls.push({ op: name + '.stop', slug: s }); },
+    });
+    return {
+      camera: stream('camera'), microphone: stream('microphone'), location: stream('location'),
+      speech: { speak: async (s, r) => { calls.push({ op: 'speak', slug: s, r }); return { ok: true }; }, stop: (s) => { calls.push({ op: 'speech.stop', slug: s }); } },
+      haptics: { vibrate: async (s, p) => { calls.push({ op: 'vibrate', slug: s, p }); return { ok: true }; } },
+    };
+  };
+  const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString('base64');
+
+  section('v1.3 device capabilities — each one is refused without ITS grant, and without the home');
+  {
+    const a = await bootNet(['motion', 'keep_awake', 'local_storage', 'network'], null, fakeDevice);
+    const asks = [
+      { type: 'camera.start', id: 100, opts: {} }, { type: 'microphone.start', id: 101, opts: {} }, { type: 'location.start', id: 102, opts: {} },
+      { type: 'speech.speak', id: 103, text: 'hello' }, { type: 'haptics.vibrate', id: 104, pattern: [100] },
+    ];
+    let refused = 0;
+    for (const m of asks) { const r = await a.ask(m); if (r && r.ok === false && /permission not granted/.test(r.error)) refused++; }
+    for (const t of ['camera.stop', 'microphone.stop', 'location.stop', 'speech.stop']) ctx.emit({ ch: 'skipi-plugin', v: 1, token: a.tok, type: t });
+    ok(refused === 5 && a.calls.length === 0, 'camera / microphone / location / speech / vibrate are refused without their own grant (other grants do not imply them)');
+    ok(['camera.start', 'microphone.start', 'location.start', 'speech.speak', 'haptics.vibrate', 'camera.stop', 'speech.stop'].every((t) => a.rt._audit().some((x) => x.indexOf('DENY ' + t) === 0)), 'and every refusal is audited');
+    a.rt.close();
+    ok(a.calls.length === 0, 'closing a plugin that used no device capability does not call the home');
+    const b = await bootNet(['camera', 'microphone', 'location', 'speech', 'vibrate'], null, null);
+    let unavailable = 0;
+    for (const m of asks) { const r = await b.ask(Object.assign({}, m, { id: m.id + 100 })); if (r && r.ok === false && /not available/.test(r.error)) unavailable++; }
+    ok(unavailable === 5, 'granted, but the home did not opt in (no host.camera / microphone / location / speech / haptics) → refused');
+    b.rt.close();
+    const c = await bootNet(['camera'], null, fakeDevice);
+    const r1 = await c.ask({ type: 'microphone.start', id: 300, opts: {} });
+    const r2 = await c.ask({ type: 'location.start', id: 301, opts: {} });
+    ok(r1 && r1.ok === false && r2 && r2.ok === false && c.calls.length === 0, '`camera` implies neither `microphone` nor `location`');
+    c.rt.close();
+  }
+
+  section('v1.3 streams — options are clamped, items are cleaned and reach only the mount that started them');
+  {
+    const a = await bootNet(['camera', 'microphone', 'location'], null, fakeDevice);
+    const r = await a.ask({ type: 'camera.start', id: 310, opts: { facing: 'sideways', width: 99999, fps: 500, quality: 7, deviceId: 'x' } });
+    const cam = a.calls.find((c) => c.op === 'camera.start') || { o: {} };
+    ok(r && r.ok === true && JSON.stringify(cam.o) === JSON.stringify({ facing: 'environment', width: 1280, fps: 15, quality: 0.95 }), 'camera.start reaches the home with facing / width / fps / quality clamped and nothing else');
+    await a.ask({ type: 'camera.start', id: 311, opts: 'junk' });
+    ok(JSON.stringify(a.calls.filter((c) => c.op === 'camera.start')[1].o) === JSON.stringify({ facing: 'environment', width: 320, fps: 2, quality: 0.6 }), 'malformed options fall back to the defaults (320 px, 2 fps)');
+    ctx.framePosts.length = 0;
+    cam.push({ t: 1000, width: 320, height: 240, base64: JPEG, extra: 'dropped', mime: 'text/html' });
+    cam.push({ t: 1001, width: 320, height: 240, base64: 'not base64 <script>' });
+    cam.push({ t: 1002, base64: '' }); cam.push(null); cam.push('junk');
+    const frames = ctx.framePosts.filter((m) => m.type === 'stream.data');
+    ok(frames.length === 1 && frames[0].stream === 'camera' && frames[0].seq === 1 && JSON.stringify(frames[0].data) === JSON.stringify({ t: 1000, width: 320, height: 240, mime: 'image/jpeg', base64: JPEG }),
+      'a camera frame is forwarded as {t, width, height, mime:image/jpeg, base64}; malformed frames and foreign fields are dropped');
+    ctx.framePosts.length = 0;
+    cam.push({ t: 1, width: 1, height: 1, base64: 'A'.repeat(2800004) });
+    ok(!ctx.framePosts.some((m) => m.type === 'stream.data'), 'an oversized frame is dropped');
+
+    await a.ask({ type: 'microphone.start', id: 312, opts: { chunkMs: 5 } });
+    const mic = a.calls.find((c) => c.op === 'microphone.start');
+    ctx.framePosts.length = 0;
+    mic.push({ t: 5, sampleRate: 48000, level: 3, pcm: 'AAAA' }); mic.push({ pcm: {} });
+    const chunks = ctx.framePosts.filter((m) => m.type === 'stream.data');
+    ok(mic.o.chunkMs === 50 && chunks.length === 1 && chunks[0].stream === 'microphone' && JSON.stringify(chunks[0].data) === JSON.stringify({ t: 5, sampleRate: 48000, level: 1, pcm: 'AAAA' }), 'a microphone chunk is forwarded as {t, sampleRate, level 0..1, pcm}; chunkMs is clamped');
+
+    await a.ask({ type: 'location.start', id: 313, opts: { highAccuracy: 1 } });
+    const loc = a.calls.find((c) => c.op === 'location.start');
+    ctx.framePosts.length = 0;
+    loc.push({ t: 7, lat: 59.93, lon: 30.31, accuracy: 12, speed: NaN, heading: 'north', altitude: null, address: 'dropped' });
+    loc.push({ lat: 123, lon: 0 }); loc.push({ lat: '59', lon: 30 });
+    const fixes = ctx.framePosts.filter((m) => m.type === 'stream.data');
+    ok(loc.o.highAccuracy === true && fixes.length === 1 && JSON.stringify(fixes[0].data) === JSON.stringify({ t: 7, lat: 59.93, lon: 30.31, accuracy: 12, altitude: null, speed: null, heading: null }), 'a position is forwarded as numbers or null; impossible coordinates are dropped');
+
+    ctx.emit({ ch: 'skipi-plugin', v: 1, token: a.tok, type: 'camera.stop' });
+    ok(a.calls.filter((c) => c.op === 'camera.stop').length === 1, 'camera.stop from the plugin stops the home camera');
+    a.rt.close();
+    ok(a.calls.filter((c) => c.op === 'camera.stop').length === 1 && a.calls.some((c) => c.op === 'microphone.stop') && a.calls.some((c) => c.op === 'location.stop'), 'close() itself stops the streams the plugin left on, and does not stop the camera twice');
+    const me2 = ctx.makeMountEl();
+    const op2 = a.rt.open(slug, me2);
+    const tok2 = JSON.parse(me2._child.srcdoc.match(/__SKIPI_TOKEN__=("[0-9a-f]+")/)[1]);
+    await ctx.tick(); await ctx.tick();
+    ctx.emit({ ch: 'skipi-plugin', v: 1, token: tok2, type: 'ready' });
+    ctx.emit({ ch: 'skipi-plugin', v: 1, token: tok2, type: 'mounted', height: 100, selfcheck: {} });
+    await op2;
+    ctx.framePosts.length = 0;
+    const late = [mic.push({ t: 9, sampleRate: 48000, level: 0.1, pcm: 'AAAA' }), loc.push({ lat: 1, lon: 1 })];
+    ok(late[0] === false && late[1] === false && !ctx.framePosts.some((m) => m.type === 'stream.data'), 'after close the old pushes are inert: no audio or position reaches the next plugin');
+    a.rt.close();
+  }
+
+  section('v1.3 speech and vibration — cleaned requests, released on close');
+  {
+    const a = await bootNet(['speech', 'vibrate'], null, fakeDevice);
+    const r = await a.ask({ type: 'speech.speak', id: 320, text: 'x'.repeat(900), lang: 'ru-RU"; rm -rf', rate: 99, pitch: 'high' });
+    const sp = a.calls.find((c) => c.op === 'speak') || { r: {} };
+    ok(r && r.ok === true && sp.slug === slug && sp.r.text.length === 500 && sp.r.lang === '' && sp.r.rate === 2 && sp.r.pitch === 1, 'speech.speak: text capped at 500 chars, a malformed language dropped, rate / pitch clamped');
+    await a.ask({ type: 'speech.speak', id: 321, text: 'Левый борт, двенадцать', lang: 'ru-RU' });
+    ok(a.calls.filter((c) => c.op === 'speak')[1].r.lang === 'ru-RU', 'a well-formed language tag passes');
+    const r2 = await a.ask({ type: 'speech.speak', id: 322, text: '   ' });
+    ok(r2 && r2.ok === false && a.calls.filter((c) => c.op === 'speak').length === 2, 'an empty phrase is refused');
+    const r3 = await a.ask({ type: 'haptics.vibrate', id: 323, pattern: [100, 50, 99999, -5, 'x'].concat(new Array(40).fill(10)) });
+    const vb = a.calls.find((c) => c.op === 'vibrate') || { p: [] };
+    ok(r3 && r3.ok === true && vb.p.length === 16 && vb.p[2] === 2000 && vb.p[3] === 0 && vb.p[4] === 0, 'haptics.vibrate: at most 16 steps, each 0–2000 ms');
+    await a.ask({ type: 'haptics.vibrate', id: 324, pattern: 300 });
+    ok(JSON.stringify(a.calls.filter((c) => c.op === 'vibrate')[1].p) === '[300]', 'a single duration is accepted');
+    a.rt.close();
+    ok(a.calls.some((c) => c.op === 'speech.stop'), 'close() stops speech the plugin started');
+  }
+
+  section('v1.3 the frame side — hostApi.camera / microphone / location / speech / haptics');
+  {
+    const shim = (runtimeSource.match(/var SHIM_SRC = `([\s\S]*?)`;/) || [])[1] || '';
+    const posts = []; let onMsg = null; let hostApi = null;
+    const frameWin = {
+      __SKIPI_TOKEN__: 'T', SkipiPlugins: {}, parent: { postMessage: (m) => posts.push(m) },
+      addEventListener: (t, fn) => { if (t === 'message') onMsg = fn; },
+      localStorage: { getItem() { throw new Error('blocked'); } },
+    };
+    const frameDoc = { head: { appendChild() {} }, body: { scrollHeight: 10 }, createElement: () => ({}) };
+    new Function('window', 'document', 'parent', 'fetch', 'setTimeout', 'ResizeObserver', shim)(
+      frameWin, frameDoc, frameWin.parent, () => Promise.reject(new Error('csp')), setTimeout, undefined);
+    const mountWith = async (perms) => {
+      frameWin.SkipiPlugins[slug] = { mount: (el, api) => { hostApi = api; } };
+      onMsg({ data: { ch: 'skipi-plugin', token: 'T', type: 'init', slug, css: '', js: '', permissions: perms, nonce: 'n', hostId: 'h' } });
+      await ctx.tick(); await ctx.tick();
+    };
+    await mountWith([]);
+    posts.length = 0;
+    let rejected = 0;
+    for (const call of [() => hostApi.camera.start({}), () => hostApi.microphone.start(), () => hostApi.location.start(), () => hostApi.speech.speak('hi'), () => hostApi.haptics.vibrate(100)]) await call().catch(() => rejected++);
+    hostApi.camera.stop(); hostApi.microphone.stop(); hostApi.location.stop(); hostApi.speech.stop();
+    ok(rejected === 5 && posts.length === 0, 'without grants every call rejects in the frame and nothing is posted to the host');
+    await mountWith(['camera', 'location', 'speech', 'vibrate']);
+    posts.length = 0;
+    const frames = [], fixes = [];
+    const off = hostApi.camera.onFrame((f) => frames.push(f));
+    hostApi.location.onPosition((p) => fixes.push(p));
+    const pr = hostApi.camera.start({ facing: 'user', fps: 1 });
+    const sent = posts.find((m) => m.type === 'camera.start');
+    ok(sent && sent.token === 'T' && sent.opts.facing === 'user', 'with the grant camera.start posts a token-stamped message with the options');
+    onMsg({ data: { ch: 'skipi-plugin', token: 'T', type: 'rpc.result', id: sent.id, ok: true, value: { ok: true, width: 320, height: 240 } } });
+    ok((await pr).width === 320, 'and resolves with the host answer');
+    onMsg({ data: { ch: 'skipi-plugin', token: 'T', type: 'stream.data', stream: 'camera', seq: 1, data: { t: 1, width: 320, height: 240, mime: 'image/jpeg', base64: JPEG } } });
+    onMsg({ data: { ch: 'skipi-plugin', token: 'BAD', type: 'stream.data', stream: 'camera', seq: 2, data: { base64: JPEG } } });
+    onMsg({ data: { ch: 'skipi-plugin', token: 'T', type: 'stream.data', stream: 'location', seq: 1, data: { lat: 1, lon: 2 } } });
+    onMsg({ data: { ch: 'skipi-plugin', token: 'T', type: 'stream.data', stream: 'nonsense', seq: 1, data: {} } });
+    ok(frames.length === 1 && frames[0].seq === 1 && frames[0].base64 === JPEG && fixes.length === 1 && fixes[0].lon === 2, 'frames reach onFrame, positions reach onPosition; a wrong token or an unknown stream is ignored');
+    off();
+    onMsg({ data: { ch: 'skipi-plugin', token: 'T', type: 'stream.data', stream: 'camera', seq: 3, data: { base64: JPEG } } });
+    ok(frames.length === 1, 'unsubscribe stops delivery');
+    hostApi.speech.speak({ text: 'Новый максимум', lang: 'ru-RU' }).catch(() => {});
+    hostApi.haptics.vibrate([100, 50, 100]).catch(() => {});
+    const sp = posts.find((m) => m.type === 'speech.speak'), vb = posts.find((m) => m.type === 'haptics.vibrate');
+    ok(sp && sp.text === 'Новый максимум' && sp.lang === 'ru-RU' && vb && vb.pattern.length === 3, 'speech.speak and haptics.vibrate post their requests');
+  }
+
   return { pass, fail };
 }
 
