@@ -3,6 +3,22 @@
 Semver per `CONTRACT.md`: MAJOR = breaking wire/`cfg`/`api`/loader/host change;
 MINOR = additive; PATCH = backwards-compatible bug fix.
 
+## 1.2.0 — 2026-11-25
+
+Additive (MINOR). Owner decision 25.11.2026: the marine clinometer is to run as a Skipi plugin on the phone's
+sensors (marine-clinometer issue #2; proposal `docs/HOST_MOTION_PROPOSAL.md` in that repository).
+
+- `hostApi.motion.start / onSamples / stop` — **host-mediated** motion sensors, grant `motion`. The home reads
+  the accelerometer and gyroscope and pushes rows `[t_ms, ax, ay, az, wx, wy, wz]`; the runtime validates rows,
+  caps a batch at 500, numbers batches and delivers them only to the mount that started the sensors.
+- `hostApi.screen.keepAwake(on)` — keep the screen on, grant `keep_awake`.
+- Both are opt-in per home (`cfg.host.motion`, `cfg.host.screen`). `close()` stops the sensors and releases
+  keep-awake itself.
+- New wire messages `motion.start`, `motion.stop`, `screen.keepAwake` (frame → host) and `motion.batch`
+  (host → frame). Frame isolation is unchanged: no `allow` attribute, same sandbox and CSP.
+- A home on 1.1.x is unaffected: without the new host adapters and grants every new call is refused.
+- Contract test: 53 → 74 assertions.
+
 ## 1.1.0 — 2026-11-24
 
 Additive (MINOR). Owner decision 24.11.2026: plugins may use the network, if it is safe and breaks nothing.
